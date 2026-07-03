@@ -1,0 +1,41 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// One row per CF problemset problem, refreshed daily by /api/ingest.
+/// This table is a pure cache of public CF data — safe to wipe and refill.
+model Problem {
+  id        String   @id // "1352A" = contestId + index
+  contestId Int
+  index     String
+  name      String
+  rating    Int?
+  tags      String[]
+  division  String? // "1".."4", stamped from the contest title
+
+  @@index([division, rating])
+}
+
+/// A finished (or in-flight) virtual round for a handle.
+model VirtualRound {
+  id           String    @id @default(cuid())
+  handle       String
+  division     String
+  durationMin  Int
+  startedAt    DateTime
+  endedAt      DateTime?
+  problemIds   String[]
+  solvedIds    String[]
+  perf         Int?
+  delta        Int?
+  ratingBefore Int?
+  createdAt    DateTime  @default(now())
+
+  @@index([handle, createdAt])
+}

@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+/* ---- Codeforces-flavoured base styles ---------------------------------- */
+
+body {
+  font-family: Verdana, Arial, sans-serif;
+  font-size: 13px;
+  color: #000;
+  background: #fff;
+}
+
+a {
+  color: #0b5da8;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+/* Boxed panel, like CF's .roundbox */
+.cf-box {
+  border: 1px solid #b9b9b9;
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+}
+
+/* Header bar inside a box — light blue by default, pink for Div. 1 */
+.cf-bar {
+  background: linear-gradient(#e8f1fa, #d3e3f3);
+  border-bottom: 1px solid #b9b9b9;
+  padding: 6px 10px;
+  font-weight: bold;
+}
+.cf-bar--pink {
+  background: linear-gradient(#fbe9ec, #f3d2d9);
+}
+
+/* CF-ish data table: full grid, small caps header, alternating rows */
+table.cf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.cf-table th {
+  background: #f0f0f0;
+  border: 1px solid #ccc;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-weight: bold;
+  text-align: left;
+}
+table.cf-table td {
+  border: 1px solid #ccc;
+  padding: 5px 8px;
+  vertical-align: middle;
+}
+table.cf-table tbody tr:nth-child(even) td {
+  background: #f7f7f7;
+}
+table.cf-table tbody tr.cf-row--solved td {
+  background: #ebf7eb;
+}
+
+.cf-verdict-ok {
+  color: #00742c;
+  font-weight: bold;
+}
+
+/* Inputs / selects / buttons in the old-web style */
+.cf-input,
+.cf-select {
+  border: 1px solid #b9b9b9;
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 13px;
+  background: #fff;
+}
+.cf-input:focus,
+.cf-select:focus {
+  outline: 2px solid #cfe1f2;
+}
+
+.cf-btn {
+  border: 1px solid #7ba7cc;
+  border-radius: 3px;
+  background: linear-gradient(#f3f9ff, #d3e3f3);
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.cf-btn:hover {
+  background: linear-gradient(#e8f1fa, #c2d8ee);
+}
+.cf-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.cf-btn--danger {
+  border-color: #c0392b;
+  background: linear-gradient(#f9e3e0, #efb9b1);
+  color: #7b1508;
+  font-weight: bold;
+}
+.cf-btn--danger:hover {
+  background: linear-gradient(#f5d3ce, #e79f95);
+}
+
+.cf-muted {
+  color: #777;
+}
+
+.cf-error {
+  border: 1px solid #e0b4b4;
+  background: #fff6f6;
+  color: #9f3a38;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.cf-note {
+  border: 1px solid #d4c98f;
+  background: #fffbe6;
+  color: #6b5d1f;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.cf-countdown {
+  font-family: "Courier New", monospace;
+  font-size: 20px;
+  font-weight: bold;
+  letter-spacing: 1px;
+}

@@ -1,108 +1,92 @@
 # CP Contester
 
-On-demand **Codeforces virtual contests**: enter your CF handle, pick a division
-(Div. 1–4) and a duration, and get a contest built only from problems you
-haven't solved. Solve on real Codeforces; the app detects your ACs and, when
-the round ends, shows an estimated performance and rating change.
+A small app for **you and friends**: on-demand Codeforces virtual contests.
 
-No login, no passwords — everything uses **public** CF data by handle.
-The browser never calls codeforces.com directly; all CF traffic goes through
-the `/api/cf/[method]` proxy route.
+1. Enter a CF handle, pick a division and duration.
+2. Get five problems you have **not** solved yet.
+3. Paste code and **run sample tests** in the app (like a parse-tests extension).
+4. **Submit on codeforces.com** — Accepted is detected automatically.
+5. Finish the round; your **profile** shows contests given, problems solved, and per-round performance (solved count + ICPC penalty).
+
+No rating predictor. Optional signup links finished rounds to your account.
+
+The browser never calls codeforces.com directly for the API; CF traffic goes through
+`/api/cf/[method]`. Sample statements are fetched server-side and cached.
 
 ## Layout
 
 | Package | What |
 |---|---|
-| `apps/web` | Next.js (App Router): UI, `/api/cf` proxy, `/api/ingest` cron, contest build/finish routes |
-| `packages/cf` | Typed CF client + zod schemas + `divisionOf()` |
-| `packages/rating` | Pure performance → delta estimator (Vitest-tested) |
-| `packages/db` | Prisma schema + client (`Problem`, `VirtualRound`) |
+| `apps/web` | Next.js UI, CF proxy, ingest, contest build/finish, sample run, profile |
+| `packages/cf` | Typed CF client + zod schemas + `divisionOf()` / `roundProgress()` |
+| `packages/db` | Prisma schema + client (`User`, `Problem`, `VirtualRound`, `IngestMeta`) |
+| `packages/rating` | Unused legacy estimator (kept for now; not wired into the app) |
 
-## Architecture (what talks to what)
+## Architecture
 
 ```
-Browser ──► Next.js API routes ──► Codeforces API (proxy / build / ingest)
-                │
+Browser ──► Next.js API routes ──► Codeforces (API + problem HTML for samples)
+                │              └──► Piston (run code on samples)
                 └──► Prisma ──► Supabase Postgres
-                     Problem cache + finished VirtualRound rows
+                     Problem cache (+ samples) + finished VirtualRound rows
 ```
 
-You do **not** need `@supabase/supabase-js` or Supabase Auth for v1.
-Supabase is used only as a hosted Postgres database. Prisma is the client.
-In-flight contests live in `localStorage`; only finished rounds are written to
-the DB.
+In-flight contests live in `localStorage`. Finished rounds are written to the DB
+and shown on `/profile`.
 
-## Connect Supabase (do this once)
+## Setup
 
 1. Create a free project at [supabase.com](https://supabase.com).
-2. Open **Project Settings → Database → Connection string**.
-3. Copy two URIs into both env files below (same values in each):
+2. Copy connection strings into both env files:
 
    | Env var | Which string | Notes |
    |---|---|---|
    | `DATABASE_URL` | **Transaction** pooler (port **6543**) | Append `?pgbouncer=true` |
    | `DIRECT_URL` | **Session** pooler (port **5432**) | Used by `prisma migrate` only |
    | `CRON_SECRET` | any long random string | Guards `/api/ingest` |
+   | `SESSION_SECRET` | ≥16 random chars | Cookie sessions for login |
 
    ```bash
    cp apps/web/.env.example apps/web/.env.local
    cp packages/db/.env.example packages/db/.env
-   # edit both files with your real URIs + CRON_SECRET
    ```
 
-4. Install, migrate, run:
+3. Install, migrate, run:
 
    ```bash
-   pnpm install                         # also runs prisma generate
-   pnpm --filter @cp/db migrate:deploy  # creates Problem + VirtualRound tables
-   pnpm --filter web dev                # http://localhost:3000
+   pnpm install
+   pnpm --filter @cp/db migrate:deploy
+   pnpm --filter web dev
    ```
 
-5. Seed the problem cache **once** (daily cron re-runs it in prod):
+4. Seed the problem cache once:
 
    ```bash
    curl -H "x-ingest-secret: <your-CRON_SECRET>" http://localhost:3000/api/ingest
    ```
 
-   That pulls `problemset.problems` + `contest.list` (two CF calls), stamps
-   each problem's division from its contest title, and fills `Problem`
-   (~11k rows). Until this has run, "Start" returns
-   `503 problem cache is empty`.
+## Sample tests
 
-## Local development
+- **Sample tests** loads I/O from the CF problem page and caches it on `Problem.samples`.
+- **Run samples** executes your code via the public [Piston](https://github.com/engineer-man/piston) API (`PISTON_URL`, default `https://emkc.org/api/v2/piston/execute`).
+- Status in the contest table:
+  - **Samples passed** — all sample cases green
+  - **Accepted** — CF `OK` detected (or manual mark)
 
-```bash
-pnpm install
-pnpm test                       # vitest: packages/rating + packages/cf
-# (env files + migrate + ingest — see above)
-pnpm --filter web dev
-```
+Submit on Codeforces for the real verdict; this app does not host a full judge.
 
-## Deploying to Vercel
+## Profile
 
-1. Import the repo; set **Root Directory** to `apps/web` (Vercel detects the
-   Turborepo + pnpm workspace and installs from the repo root).
-2. Set `DATABASE_URL`, `DIRECT_URL`, `CRON_SECRET` env vars (same as local).
-3. `apps/web/vercel.json` already schedules `/api/ingest` daily at 03:17 UTC.
-4. Run the migration once from your machine
-   (`pnpm --filter @cp/db migrate:deploy`) and hit `/api/ingest` once.
+`/profile?handle=…` shows:
 
-## How the estimate works
+- Contests given
+- Unique problems solved in virtual contests
+- Average solves per contest and overall solve rate
+- Per-round solved/total and ICPC penalty
+- Optional public CF rating / CF solve count
 
-`packages/rating`: P(solve problem of difficulty d at rating R) is the Elo
-expectancy `1 / (1 + 10^((d-R)/400))`. We binary-search the R whose expected
-solve count equals your actual solve count → that's the performance;
-`delta = round((perf − rating) / 2)`. It is a deliberately rough single-user
-estimate — speed, hacks, and the actual field are ignored, and it is labeled
-as such in the UI.
+## Deploy (Vercel)
 
-## v1 scope notes (TODOs, intentionally not built)
-
-- **Handle-ownership verification** — anyone can start a round as any handle.
-- **Penalty / speed scoring** — solve minute is recorded per problem
-  (`solvedIds` + minute in the UI state) as a seam for ICPC/IOI-style scoring.
-- Combined "Div. 1 + Div. 2" rounds are filed under Div. 1 (first match in the
-  title); a future version could file them under both.
-- The contest builder may pick two problems from the same past contest.
-- `VirtualRound` rows are written only at round end; in-flight rounds live in
-  `localStorage` (timer is derived from `startedAt`, so refresh can't pause it).
+1. Root directory `apps/web`; set `DATABASE_URL`, `DIRECT_URL`, `CRON_SECRET`, `SESSION_SECRET`.
+2. `apps/web/vercel.json` schedules `/api/ingest` daily.
+3. Run `pnpm --filter @cp/db migrate:deploy` once, then hit `/api/ingest` once.

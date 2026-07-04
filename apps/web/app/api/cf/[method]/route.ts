@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { throttleCf } from "@/lib/cf-throttle";
+import { clientIp, rateLimit } from "@/lib/rate-limit";
 
 /**
  * Server-side proxy for the Codeforces API.
@@ -21,25 +23,18 @@ const ALLOWED_METHODS = new Set([
 
 const CACHED_METHODS = new Set(["problemset.problems", "contest.list"]);
 
-// Naive per-instance throttle: serialize upstream calls with a minimum gap so
-// a burst of users can't push this instance past CF's ~5 req/s limit.
-const MIN_GAP_MS = 250;
-let lastCallAt = 0;
-let queue: Promise<void> = Promise.resolve();
-
-function throttle(): Promise<void> {
-  queue = queue.then(async () => {
-    const wait = lastCallAt + MIN_GAP_MS - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    lastCallAt = Date.now();
-  });
-  return queue;
-}
-
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ method: string }> },
 ) {
+  const ip = clientIp(req);
+  if (!rateLimit(`cf-proxy:${ip}`, { limit: 60, windowMs: 60_000 })) {
+    return NextResponse.json(
+      { status: "FAILED", comment: "rate limit exceeded — try again shortly" },
+      { status: 429 },
+    );
+  }
+
   const { method } = await params;
   if (!ALLOWED_METHODS.has(method)) {
     return NextResponse.json(
@@ -51,7 +46,7 @@ export async function GET(
   const qs = req.nextUrl.searchParams.toString();
   const url = `https://codeforces.com/api/${method}${qs ? `?${qs}` : ""}`;
 
-  await throttle();
+  await throttleCf();
 
   let upstream: Response;
   try {

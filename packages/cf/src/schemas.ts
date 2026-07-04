@@ -23,6 +23,8 @@ export const CfSubmissionSchema = z.object({
   creationTimeSeconds: z.number(),
   problem: CfProblemSchema,
   verdict: z.string().optional(),
+  /** Present on partial-scoring contests (IOI-style); absent on classic CF. */
+  points: z.number().optional(),
 });
 export type CfSubmission = z.infer<typeof CfSubmissionSchema>;
 

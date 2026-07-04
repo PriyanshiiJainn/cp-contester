@@ -8,8 +8,19 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+/// App account. Competitive identity is the linked Codeforces handle.
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  passwordHash String
+  handle       String         @unique
+  createdAt    DateTime       @default(now())
+  rounds       VirtualRound[]
+}
+
 /// One row per CF problemset problem, refreshed daily by /api/ingest.
-/// This table is a pure cache of public CF data — safe to wipe and refill.
+/// Metadata is public CF data (safe to wipe/refill). `samples` is filled on
+/// demand from the CF statement and preserved across ingest when possible.
 model Problem {
   id        String   @id // "1352A" = contestId + index
   contestId Int
@@ -18,24 +29,40 @@ model Problem {
   rating    Int?
   tags      String[]
   division  String? // "1".."4", stamped from the contest title
+  /// Sample tests: [{ input, output }, ...] from the CF problem page.
+  samples   Json?
 
   @@index([division, rating])
 }
 
-/// A finished (or in-flight) virtual round for a handle.
+/// Singleton row tracking the last problem-cache ingest attempt.
+model IngestMeta {
+  id           Int       @id @default(1)
+  lastOkAt     DateTime?
+  lastErrorAt  DateTime?
+  lastError    String?
+  problems     Int?
+  withDivision Int?
+}
+
+/// A finished virtual round for a handle.
 model VirtualRound {
   id           String    @id @default(cuid())
   handle       String
+  userId       String?
+  user         User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   division     String
   durationMin  Int
   startedAt    DateTime
   endedAt      DateTime?
   problemIds   String[]
   solvedIds    String[]
-  perf         Int?
-  delta        Int?
-  ratingBefore Int?
+  /// Per-problem solve minute: { "1352A": 12, ... }
+  solveMinutes Json?
+  /// ICPC penalty minutes (Σ minute + 20·wrongs over full solves).
+  penalty      Int?
   createdAt    DateTime  @default(now())
 
   @@index([handle, createdAt])
+  @@index([userId, createdAt])
 }

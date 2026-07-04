@@ -14,4 +14,4 @@ export function getPrisma(): PrismaClient {
   return globalForPrisma.__cpPrisma;
 }
 
-export type { Problem, VirtualRound } from "@prisma/client";
+export type { IngestMeta, Problem, User, VirtualRound } from "@prisma/client";

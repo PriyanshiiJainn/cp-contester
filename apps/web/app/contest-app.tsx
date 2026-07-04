@@ -1,8 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createCfClient, solvedKeys, CfApiError } from "@cp/cf";
-import { estimate } from "@cp/rating";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { createCfClient, roundProgress, solvedKeys, CfApiError } from "@cp/cf";
+import { IngestStatus } from "./ingest-status";
+import { SampleRunner } from "./sample-runner";
 
 /* ------------------------------------------------------------------ types */
 
@@ -15,8 +23,10 @@ interface Slot {
   rating: number;
 }
 
-interface SolveMark {
-  minute: number;
+interface ProblemMark {
+  minute: number | null;
+  wrongAttempts: number;
+  partial: number;
   manual: boolean;
 }
 
@@ -24,16 +34,16 @@ interface Round {
   handle: string;
   division: "1" | "2" | "3" | "4";
   durationMin: number;
-  startedAt: number; // epoch ms — remaining time is ALWAYS derived from this
-  ratingBefore: number | null;
+  startedAt: number;
   slots: Slot[];
-  solved: Record<string, SolveMark>;
+  marks: Record<string, ProblemMark>;
+  /** Set when the round ends so a failed save can be retried after refresh. */
+  finishedAt?: number;
 }
 
 interface RoundResult {
-  perf: number;
-  delta: number;
   solvedCount: number;
+  penalty: number;
   endedAt: number;
 }
 
@@ -41,13 +51,12 @@ type Phase = "setup" | "running" | "finished";
 
 /* ------------------------------------------------------------------ const */
 
-const cf = createCfClient(); // browser -> /api/cf proxy, never codeforces.com
-
+const cf = createCfClient();
 const DIVISIONS = ["1", "2", "3", "4"] as const;
 const DURATIONS = [60, 90, 120, 150, 180];
 const POLL_MS = 20_000;
 const STORAGE_KEY = "cp-contester:active-round";
-const UNRATED_BASELINE = 1400;
+const ICPC_WRONG_PENALTY = 20;
 
 const problemUrl = (s: Slot) =>
   `https://codeforces.com/problemset/problem/${s.contestId}/${s.index}`;
@@ -61,15 +70,58 @@ function fmtClock(ms: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+function isFullSolve(m: ProblemMark | undefined): boolean {
+  return m != null && m.minute != null && m.partial >= 1;
+}
+
+function computePenalty(round: Round): number {
+  let penalty = 0;
+  for (const s of round.slots) {
+    const m = round.marks[s.id];
+    if (!isFullSolve(m) || m.minute == null) continue;
+    penalty += m.minute + ICPC_WRONG_PENALTY * Math.max(0, m.wrongAttempts);
+  }
+  return penalty;
+}
+
+function normalizeRound(raw: unknown): Round | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<Round> & {
+    solved?: Record<string, { minute: number; manual: boolean }>;
+  };
+  if (!r.startedAt || !Array.isArray(r.slots) || r.slots.length === 0) return null;
+  if (!r.handle || !r.division || !r.durationMin) return null;
+
+  let marks = r.marks;
+  if (!marks && r.solved) {
+    marks = {};
+    for (const [id, m] of Object.entries(r.solved)) {
+      marks[id] = {
+        minute: m.minute,
+        wrongAttempts: 0,
+        partial: 1,
+        manual: m.manual,
+      };
+    }
+  }
+  marks ??= {};
+
+  return {
+    handle: r.handle,
+    division: r.division,
+    durationMin: r.durationMin,
+    startedAt: r.startedAt,
+    slots: r.slots,
+    marks,
+    finishedAt: typeof r.finishedAt === "number" ? r.finishedAt : undefined,
+  };
+}
+
 function loadStoredRound(): Round | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    const round = JSON.parse(raw) as Round;
-    if (!round.startedAt || !Array.isArray(round.slots) || round.slots.length === 0) {
-      return null;
-    }
-    return round;
+    return normalizeRound(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -80,16 +132,33 @@ function storeRound(round: Round | null) {
     if (round) localStorage.setItem(STORAGE_KEY, JSON.stringify(round));
     else localStorage.removeItem(STORAGE_KEY);
   } catch {
-    /* storage unavailable — the round just won't survive a refresh */
+    /* storage unavailable */
   }
+}
+
+function finishPayload(round: Round, endedAt: number) {
+  return {
+    handle: round.handle,
+    division: round.division,
+    durationMin: round.durationMin,
+    startedAt: round.startedAt,
+    endedAt,
+    problemIds: round.slots.map((s) => s.id),
+    outcomes: round.slots.map((s) => {
+      const m = round.marks[s.id];
+      return {
+        id: s.id,
+        minute: isFullSolve(m) ? m!.minute : null,
+        wrongAttempts: m?.wrongAttempts ?? 0,
+      };
+    }),
+  };
 }
 
 /* -------------------------------------------------------------- component */
 
 export function ContestApp() {
   const [phase, setPhase] = useState<Phase>("setup");
-
-  // setup state
   const [handleInput, setHandleInput] = useState("");
   const [userLoading, setUserLoading] = useState(false);
   const [user, setUser] = useState<{ handle: string; rating: number | null } | null>(null);
@@ -99,13 +168,14 @@ export function ContestApp() {
   const [building, setBuilding] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // running / finished state
   const [round, setRound] = useState<Round | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [lastPollAt, setLastPollAt] = useState<number | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
   const [result, setResult] = useState<RoundResult | null>(null);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "failed">("idle");
+  const [openSlotId, setOpenSlotId] = useState<string | null>(null);
+  const [samplesOk, setSamplesOk] = useState<Record<string, boolean>>({});
 
   const roundRef = useRef<Round | null>(null);
   roundRef.current = round;
@@ -113,7 +183,37 @@ export function ContestApp() {
 
   const endAt = round ? round.startedAt + round.durationMin * 60_000 : 0;
 
-  /* ---- finish ---- */
+  const saveRound = useCallback(async (r: Round, endedAtMs: number) => {
+    setSaveState("saving");
+    try {
+      const res = await fetch("/api/round/finish", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(finishPayload(r, endedAtMs)),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        solvedCount?: number;
+        penalty?: number;
+        error?: string;
+      };
+      if (!res.ok) {
+        setSaveState("failed");
+        return;
+      }
+      // Prefer server-recomputed totals (authoritative on retry).
+      if (typeof data.solvedCount === "number" && typeof data.penalty === "number") {
+        setResult({
+          solvedCount: data.solvedCount,
+          penalty: data.penalty,
+          endedAt: endedAtMs,
+        });
+      }
+      setSaveState("saved");
+      storeRound(null);
+    } catch {
+      setSaveState("failed");
+    }
+  }, []);
 
   const finishContest = useCallback(
     (endedAtMs: number) => {
@@ -122,51 +222,40 @@ export function ContestApp() {
       finishedRef.current = true;
 
       const cappedEnd = Math.min(endedAtMs, r.startedAt + r.durationMin * 60_000);
-      const solvedIds = Object.keys(r.solved);
-      const est = estimate({
-        slotRatings: r.slots.map((s) => s.rating),
-        solvedCount: solvedIds.length,
-        rating: r.ratingBefore ?? UNRATED_BASELINE,
-      });
-      setResult({ ...est, solvedCount: solvedIds.length, endedAt: cappedEnd });
+      const solvedCount = r.slots.filter((s) => isFullSolve(r.marks[s.id])).length;
+      const penalty = computePenalty(r);
+      const finished: Round = { ...r, finishedAt: cappedEnd };
+
+      setResult({ solvedCount, penalty, endedAt: cappedEnd });
       setPhase("finished");
-      storeRound(null);
-
-      setSaveState("saving");
-      fetch("/api/round/finish", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          handle: r.handle,
-          division: r.division,
-          durationMin: r.durationMin,
-          startedAt: r.startedAt,
-          endedAt: cappedEnd,
-          problemIds: r.slots.map((s) => s.id),
-          solvedIds,
-          perf: est.perf,
-          delta: est.delta,
-          ratingBefore: r.ratingBefore,
-        }),
-      })
-        .then((res) => setSaveState(res.ok ? "saved" : "failed"))
-        .catch(() => setSaveState("failed"));
+      setRound(finished);
+      roundRef.current = finished;
+      storeRound(finished);
+      void saveRound(finished, cappedEnd);
     },
-    [],
+    [saveRound],
   );
-
-  /* ---- restore an in-flight round on mount (refresh can't reset the clock) */
 
   useEffect(() => {
     const stored = loadStoredRound();
     if (!stored) return;
-    // Set the ref immediately — setState alone won't update it until the next
-    // render, and finishContest (below) reads roundRef, not state.
     roundRef.current = stored;
     setRound(stored);
+
+    if (stored.finishedAt != null) {
+      finishedRef.current = true;
+      setResult({
+        solvedCount: stored.slots.filter((s) => isFullSolve(stored.marks[s.id])).length,
+        penalty: computePenalty(stored),
+        endedAt: stored.finishedAt,
+      });
+      setPhase("finished");
+      queueMicrotask(() => void saveRound(stored, stored.finishedAt!));
+      return;
+    }
+
     const storedEnd = stored.startedAt + stored.durationMin * 60_000;
     if (Date.now() >= storedEnd) {
-      // Timer ran out while the tab was closed: settle the round now.
       setPhase("running");
       queueMicrotask(() => finishContest(storedEnd));
     } else {
@@ -175,20 +264,60 @@ export function ContestApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---- 4Hz wall-clock tick; ends the round when derived time hits zero */
+  useEffect(() => {
+    if (loadStoredRound()) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/auth/me");
+        const data = await res.json();
+        const handle = data?.user?.handle as string | undefined;
+        if (cancelled || !handle) return;
+        setHandleInput(handle);
+        setUserLoading(true);
+        setError(null);
+        try {
+          const [info, subs] = await Promise.all([
+            cf.getUserInfo(handle),
+            cf.getUserStatus(handle, { from: 1, count: 10_000 }),
+          ]);
+          if (cancelled) return;
+          setUser({ handle: info.handle, rating: info.rating ?? null });
+          setSolvedTotal(solvedKeys(subs).size);
+        } catch (e) {
+          if (!cancelled) {
+            setError(
+              e instanceof CfApiError
+                ? `Codeforces says: ${e.message}`
+                : "Failed to load the handle. Try again.",
+            );
+          }
+        } finally {
+          if (!cancelled) setUserLoading(false);
+        }
+      } catch {
+        /* not logged in */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (phase !== "running") return;
     const t = setInterval(() => {
       setNow(Date.now());
-      if (roundRef.current && Date.now() >= roundRef.current.startedAt + roundRef.current.durationMin * 60_000) {
+      if (
+        roundRef.current &&
+        Date.now() >=
+          roundRef.current.startedAt + roundRef.current.durationMin * 60_000
+      ) {
         finishContest(Date.now());
       }
     }, 250);
     return () => clearInterval(t);
   }, [phase, finishContest]);
-
-  /* ---- poll user.status every 20s while running ---- */
 
   useEffect(() => {
     if (phase !== "running" || !round) return;
@@ -198,27 +327,40 @@ export function ContestApp() {
       const r = roundRef.current;
       if (!r) return;
       try {
-        // Recent submissions are enough mid-contest; keeps payloads small.
         const subs = await cf.getUserStatus(r.handle, { from: 1, count: 100 });
         if (cancelled) return;
         const slotIds = new Set(r.slots.map((s) => s.id));
         const roundEnd = r.startedAt + r.durationMin * 60_000;
+        const progress = roundProgress(subs, {
+          startedAt: r.startedAt,
+          endedAt: Math.min(Date.now(), roundEnd),
+          slotIds,
+        });
+
+        const marks = { ...r.marks };
         let changed = false;
-        const solved = { ...r.solved };
-        for (const sub of subs) {
-          const cid = sub.problem.contestId ?? sub.contestId;
-          if (sub.verdict !== "OK" || cid === undefined) continue;
-          const key = `${cid}${sub.problem.index}`;
-          const t = sub.creationTimeSeconds * 1000;
-          if (!slotIds.has(key) || solved[key] || t < r.startedAt || t > roundEnd) continue;
-          solved[key] = {
-            minute: Math.floor((t - r.startedAt) / 60_000),
+        for (const [key, p] of progress) {
+          const prev = marks[key];
+          if (prev?.manual && isFullSolve(prev)) continue;
+          const nextMark: ProblemMark = {
+            minute: p.minute,
+            wrongAttempts: p.wrongAttempts,
+            partial: p.partial,
             manual: false,
           };
-          changed = true;
+          if (
+            !prev ||
+            prev.minute !== nextMark.minute ||
+            prev.wrongAttempts !== nextMark.wrongAttempts ||
+            prev.partial !== nextMark.partial ||
+            prev.manual
+          ) {
+            marks[key] = nextMark;
+            changed = true;
+          }
         }
         if (changed) {
-          const next = { ...r, solved };
+          const next = { ...r, marks };
           setRound(next);
           storeRound(next);
         }
@@ -244,8 +386,6 @@ export function ContestApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, round?.startedAt]);
 
-  /* ---- setup actions ---- */
-
   const loadUser = async () => {
     const handle = handleInput.trim();
     if (!handle) return;
@@ -256,7 +396,7 @@ export function ContestApp() {
     try {
       const [info, subs] = await Promise.all([
         cf.getUserInfo(handle),
-        cf.getUserStatus(handle),
+        cf.getUserStatus(handle, { from: 1, count: 10_000 }),
       ]);
       setUser({ handle: info.handle, rating: info.rating ?? null });
       setSolvedTotal(solvedKeys(subs).size);
@@ -290,13 +430,14 @@ export function ContestApp() {
         division,
         durationMin,
         startedAt: Date.now(),
-        ratingBefore: user.rating,
         slots: data.slots as Slot[],
-        solved: {},
+        marks: {},
       };
       finishedRef.current = false;
       setResult(null);
       setSaveState("idle");
+      setSamplesOk({});
+      setOpenSlotId(null);
       setRound(newRound);
       storeRound(newRound);
       setPhase("running");
@@ -310,19 +451,24 @@ export function ContestApp() {
   const toggleManual = (slotId: string) => {
     const r = roundRef.current;
     if (!r || phase !== "running") return;
-    const solved = { ...r.solved };
-    const mark = solved[slotId];
-    if (mark) {
-      if (!mark.manual) return; // auto-detected ACs can't be unmarked
-      delete solved[slotId];
+    const marks = { ...r.marks };
+    const mark = marks[slotId];
+    if (mark && isFullSolve(mark)) {
+      if (!mark.manual) return;
+      delete marks[slotId];
     } else {
       const minute = Math.min(
         Math.floor((Date.now() - r.startedAt) / 60_000),
         r.durationMin,
       );
-      solved[slotId] = { minute, manual: true };
+      marks[slotId] = {
+        minute,
+        wrongAttempts: mark?.wrongAttempts ?? 0,
+        partial: 1,
+        manual: true,
+      };
     }
-    const next = { ...r, solved };
+    const next = { ...r, marks };
     setRound(next);
     storeRound(next);
   };
@@ -334,19 +480,36 @@ export function ContestApp() {
     setSaveState("idle");
     setPollError(null);
     setLastPollAt(null);
+    setSamplesOk({});
+    setOpenSlotId(null);
     storeRound(null);
     setPhase("setup");
   };
 
-  /* ---- derived ---- */
-
   const remaining = endAt - now;
-  const solvedCount = round ? Object.keys(round.solved).length : 0;
+  const solvedCount = round
+    ? round.slots.filter((s) => isFullSolve(round.marks[s.id])).length
+    : 0;
   const barClass = round?.division === "1" ? "cf-bar cf-bar--pink" : "cf-bar";
-  const ratingAfter =
-    result && round ? (round.ratingBefore ?? UNRATED_BASELINE) + result.delta : null;
 
-  /* ================================================================ render */
+  const formatStatus = (slotId: string, mark: ProblemMark | undefined): ReactNode => {
+    if (isFullSolve(mark)) {
+      return (
+        <span className="cf-verdict-ok">
+          Accepted
+          {mark!.minute != null ? ` at ${mark!.minute}′` : ""}
+          {mark!.manual ? " (manual)" : ""}
+        </span>
+      );
+    }
+    if (samplesOk[slotId]) {
+      return <span className="cf-verdict-ok">Samples passed</span>;
+    }
+    if (mark && mark.wrongAttempts > 0) {
+      return <span className="cf-muted">{mark.wrongAttempts} wrong on CF</span>;
+    }
+    return <span className="cf-muted">—</span>;
+  };
 
   if (phase === "setup") {
     return (
@@ -364,25 +527,36 @@ export function ContestApp() {
                 placeholder="e.g. tourist"
                 value={handleInput}
                 onChange={(e) => setHandleInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && loadUser()}
+                onKeyDown={(e) => e.key === "Enter" && void loadUser()}
                 disabled={userLoading}
               />
-              <button className="cf-btn" onClick={loadUser} disabled={userLoading || !handleInput.trim()}>
+              <button
+                className="cf-btn"
+                type="button"
+                onClick={() => void loadUser()}
+                disabled={userLoading || !handleInput.trim()}
+              >
                 {userLoading ? "Loading…" : "Load"}
               </button>
               <span className="cf-muted text-xs">
-                no password — public data only
+                public CF data — <a href="/signup">sign up</a> to keep history on
+                your profile
               </span>
             </div>
 
             {user && (
               <div className="cf-note">
-                <b>{user.handle}</b> — rating{" "}
-                <b>{user.rating ?? `unrated (using ${UNRATED_BASELINE} for the estimate)`}</b>
+                <b>{user.handle}</b>
+                {user.rating != null && (
+                  <>
+                    {" "}
+                    — CF rating <b>{user.rating}</b>
+                  </>
+                )}
                 {solvedTotal !== null && (
                   <>
-                    , <b>{solvedTotal}</b> problems solved (these are excluded from
-                    your contest)
+                    , <b>{solvedTotal}</b> problems already solved on CF (excluded
+                    from your contest)
                   </>
                 )}
               </div>
@@ -419,7 +593,8 @@ export function ContestApp() {
               </label>
               <button
                 className="cf-btn font-bold"
-                onClick={startContest}
+                type="button"
+                onClick={() => void startContest()}
                 disabled={!user || building}
                 title={user ? "" : "Load a handle first"}
               >
@@ -428,10 +603,10 @@ export function ContestApp() {
             </div>
 
             {error && <div className="cf-error">{error}</div>}
-
+            <IngestStatus />
             <p className="cf-muted text-xs">
-              The timer is non-pausable and survives refreshes. Problems open on
-              codeforces.com — submit there; ACs are detected automatically.
+              Run sample tests in the app (like a parse-tests extension), then
+              submit on codeforces.com. Accepted is detected automatically.
             </p>
           </div>
         </div>
@@ -449,7 +624,11 @@ export function ContestApp() {
             </span>
             <span className="flex items-center gap-3">
               <span className="cf-countdown">{fmtClock(remaining)}</span>
-              <button className="cf-btn cf-btn--danger" onClick={() => finishContest(Date.now())}>
+              <button
+                className="cf-btn cf-btn--danger"
+                type="button"
+                onClick={() => finishContest(Date.now())}
+              >
                 End Contest
               </button>
             </span>
@@ -460,41 +639,82 @@ export function ContestApp() {
                 <th className="w-10">#</th>
                 <th>Problem</th>
                 <th className="w-20">Rating</th>
-                <th className="w-56">Status</th>
+                <th className="w-48">Status</th>
+                <th className="w-40">Actions</th>
               </tr>
             </thead>
             <tbody>
               {round.slots.map((s) => {
-                const mark = round.solved[s.id];
+                const mark = round.marks[s.id];
+                const open = openSlotId === s.id;
                 return (
-                  <tr key={s.id} className={mark ? "cf-row--solved" : undefined}>
-                    <td className="text-center font-bold">{s.label}</td>
-                    <td>
-                      <a href={problemUrl(s)} target="_blank" rel="noopener noreferrer">
-                        {s.name}
-                      </a>{" "}
-                      <span className="cf-muted text-xs">({s.contestId}{s.index})</span>
-                    </td>
-                    <td>{s.rating}</td>
-                    <td>
-                      {mark ? (
-                        <span className="cf-verdict-ok">
-                          Solved at {mark.minute}′{mark.manual ? " (manual)" : ""}
-                        </span>
-                      ) : (
-                        <span className="cf-muted">—</span>
-                      )}{" "}
-                      {(!mark || mark.manual) && (
-                        <button
-                          className="cf-btn ml-1 !px-2 !py-0.5 text-xs"
-                          onClick={() => toggleManual(s.id)}
-                          title="Fallback when AC polling is blocked or offline"
+                  <Fragment key={s.id}>
+                    <tr
+                      className={isFullSolve(mark) ? "cf-row--solved" : undefined}
+                    >
+                      <td className="text-center font-bold">{s.label}</td>
+                      <td>
+                        <a
+                          href={problemUrl(s)}
+                          target="_blank"
+                          rel="noopener noreferrer"
                         >
-                          {mark?.manual ? "unmark" : "mark solved"}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
+                          {s.name}
+                        </a>{" "}
+                        <span className="cf-muted text-xs">
+                          ({s.contestId}
+                          {s.index})
+                        </span>
+                      </td>
+                      <td>{s.rating}</td>
+                      <td>{formatStatus(s.id, mark)}</td>
+                      <td>
+                        <button
+                          className="cf-btn !px-2 !py-0.5 text-xs"
+                          type="button"
+                          onClick={() => setOpenSlotId(open ? null : s.id)}
+                        >
+                          {open ? "Hide tests" : "Sample tests"}
+                        </button>{" "}
+                        <a
+                          className="cf-btn !px-2 !py-0.5 text-xs no-underline hover:no-underline"
+                          href={problemUrl(s)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Submit on CF
+                        </a>
+                        {(!mark || mark.manual || !isFullSolve(mark)) && (
+                          <>
+                            {" "}
+                            <button
+                              className="cf-btn !px-2 !py-0.5 text-xs"
+                              type="button"
+                              onClick={() => toggleManual(s.id)}
+                              title="Fallback when AC polling is blocked"
+                            >
+                              {isFullSolve(mark) && mark?.manual
+                                ? "unmark"
+                                : "mark AC"}
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                    {open && (
+                      <tr>
+                        <td colSpan={5} className="!p-0">
+                          <SampleRunner
+                            problemId={s.id}
+                            problemLabel={`${s.label}. ${s.name}`}
+                            onSamplesVerdict={(ok) =>
+                              setSamplesOk((prev) => ({ ...prev, [s.id]: ok }))
+                            }
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>
@@ -503,7 +723,8 @@ export function ContestApp() {
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
           <span className="cf-muted">
-            Solved {solvedCount}/{round.slots.length} · checking Codeforces every 20s
+            Accepted {solvedCount}/{round.slots.length} · checking Codeforces
+            every 20s
             {lastPollAt ? ` · last check ${fmtClock(now - lastPollAt)} ago` : ""}
           </span>
           {pollError && <span className="cf-error !py-1">{pollError}</span>}
@@ -524,43 +745,58 @@ export function ContestApp() {
               <tbody>
                 <tr>
                   <th>Solved</th>
-                  <td>
+                  <td className="font-bold">
                     {result.solvedCount} / {round.slots.length}
                   </td>
                 </tr>
                 <tr>
-                  <th>Estimated performance</th>
-                  <td className="font-bold">{result.perf}</td>
-                </tr>
-                <tr>
-                  <th>Estimated rating change</th>
-                  <td>
-                    {round.ratingBefore ?? `${UNRATED_BASELINE} (unrated baseline)`} →{" "}
-                    <b>{ratingAfter}</b>{" "}
-                    <span className={result.delta >= 0 ? "cf-verdict-ok" : "text-[#a00] font-bold"}>
-                      ({result.delta >= 0 ? "+" : ""}
-                      {result.delta})
-                    </span>
-                  </td>
+                  <th>ICPC penalty</th>
+                  <td>{result.penalty} min</td>
                 </tr>
               </tbody>
             </table>
 
-            <div className="cf-note">
-              This is a rough single-user <b>estimate</b> from problem difficulties
-              only — not a real Codeforces rating prediction. Speed, hacks, and the
-              field of participants are ignored.
-            </div>
-
             <div className="cf-muted text-xs">
               {saveState === "saving" && "Saving round…"}
-              {saveState === "saved" && "Round saved."}
-              {saveState === "failed" && "Could not save this round to the database."}
+              {saveState === "saved" && (
+                <>
+                  Round saved. See your{" "}
+                  <a href={`/profile?handle=${encodeURIComponent(round.handle)}`}>
+                    profile
+                  </a>{" "}
+                  for history and stats.
+                </>
+              )}
+              {saveState === "failed" &&
+                "Could not save this round. Retry to write it to your profile — solves and penalty are recomputed on the server."}
             </div>
 
-            <button className="cf-btn font-bold" onClick={resetToSetup}>
-              New round
-            </button>
+            <div className="flex flex-wrap gap-2">
+              {saveState === "failed" && (
+                <button
+                  className="cf-btn font-bold"
+                  type="button"
+                  onClick={() =>
+                    void saveRound(round, result.endedAt)
+                  }
+                >
+                  Retry save
+                </button>
+              )}
+              <button
+                className="cf-btn font-bold"
+                type="button"
+                onClick={resetToSetup}
+              >
+                New round
+              </button>
+              <a
+                className="cf-btn font-bold no-underline hover:no-underline"
+                href={`/profile?handle=${encodeURIComponent(round.handle)}`}
+              >
+                Open profile
+              </a>
+            </div>
           </div>
         </div>
 
@@ -573,29 +809,36 @@ export function ContestApp() {
                 <th>Problem</th>
                 <th className="w-20">Rating</th>
                 <th className="w-44">Result</th>
+                <th className="w-28">Codeforces</th>
               </tr>
             </thead>
             <tbody>
               {round.slots.map((s) => {
-                const mark = round.solved[s.id];
+                const mark = round.marks[s.id];
                 return (
-                  <tr key={s.id} className={mark ? "cf-row--solved" : undefined}>
+                  <tr
+                    key={s.id}
+                    className={isFullSolve(mark) ? "cf-row--solved" : undefined}
+                  >
                     <td className="text-center font-bold">{s.label}</td>
                     <td>
-                      <a href={problemUrl(s)} target="_blank" rel="noopener noreferrer">
-                        {s.name}
-                      </a>{" "}
-                      <span className="cf-muted text-xs">({s.contestId}{s.index})</span>
+                      {s.name}{" "}
+                      <span className="cf-muted text-xs">
+                        ({s.contestId}
+                        {s.index})
+                      </span>
                     </td>
                     <td>{s.rating}</td>
+                    <td>{formatStatus(s.id, mark)}</td>
                     <td>
-                      {mark ? (
-                        <span className="cf-verdict-ok">
-                          Solved at {mark.minute}′{mark.manual ? " (manual)" : ""}
-                        </span>
-                      ) : (
-                        <span className="cf-muted">unsolved</span>
-                      )}
+                      <a
+                        className="cf-btn inline-block !px-2 !py-0.5 text-xs no-underline hover:no-underline"
+                        href={problemUrl(s)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open on CF
+                      </a>
                     </td>
                   </tr>
                 );
@@ -607,5 +850,5 @@ export function ContestApp() {
     );
   }
 
-  return null; // transient state while restoring
+  return null;
 }

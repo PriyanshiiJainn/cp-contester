@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createCfClient, solvedKeys, CfApiError } from "@cp/cf";
 import { getPrisma } from "@cp/db";
+import { throttleCf } from "@/lib/cf-throttle";
+import { pickSlots } from "@/lib/contest-slots";
+import { clientIp, rateLimit } from "@/lib/rate-limit";
 
 /**
  * Build a virtual contest for a handle: filter the cached problemset to the
@@ -27,6 +30,14 @@ const BodySchema = z.object({
 });
 
 export async function POST(req: NextRequest) {
+  const ip = clientIp(req);
+  if (!rateLimit(`contest-build:${ip}`, { limit: 10, windowMs: 60_000 })) {
+    return NextResponse.json(
+      { error: "too many contest builds — try again in a minute" },
+      { status: 429 },
+    );
+  }
+
   let body: z.infer<typeof BodySchema>;
   try {
     body = BodySchema.parse(await req.json());
@@ -37,10 +48,10 @@ export async function POST(req: NextRequest) {
   const { handle, division } = body;
   const targets = SLOT_TARGETS[division];
 
-  // Server-side CF call (2 req max, well under the rate limit).
   const cf = createCfClient("https://codeforces.com/api");
   let solved: Set<string>;
   try {
+    await throttleCf();
     solved = solvedKeys(await cf.getUserStatus(handle));
   } catch (e) {
     const msg = e instanceof CfApiError ? e.message : "failed to fetch user status";
@@ -48,53 +59,48 @@ export async function POST(req: NextRequest) {
   }
 
   const prisma = getPrisma();
-  const pool = await prisma.problem.findMany({
-    where: { division, rating: { not: null } },
-    select: { id: true, contestId: true, index: true, name: true, rating: true },
-  });
+  const [pool, totalProblems, meta] = await Promise.all([
+    prisma.problem.findMany({
+      where: { division, rating: { not: null } },
+      select: { id: true, contestId: true, index: true, name: true, rating: true },
+    }),
+    prisma.problem.count(),
+    prisma.ingestMeta.findUnique({ where: { id: 1 } }),
+  ]);
 
   if (pool.length === 0) {
+    const lastAt = meta?.lastOkAt?.toISOString() ?? null;
+    const hint =
+      totalProblems === 0
+        ? "problem cache is empty — an operator must run POST /api/ingest with CRON_SECRET (see GET /api/health)"
+        : `no rated Div. ${division} problems in the cache — run /api/ingest to refresh (see GET /api/health)`;
     return NextResponse.json(
-      { error: "problem cache is empty for this division — run /api/ingest first" },
+      {
+        error: hint,
+        problems: totalProblems,
+        lastIngestAt: lastAt,
+      },
       { status: 503 },
     );
   }
 
-  const unsolved = pool.filter((p) => !solved.has(p.id));
-  const used = new Set<string>();
-  const slots = [];
+  const typedPool = pool.map((p) => ({
+    id: p.id,
+    contestId: p.contestId,
+    index: p.index,
+    name: p.name,
+    rating: p.rating as number,
+  }));
 
-  for (let i = 0; i < targets.length; i++) {
-    const target = targets[i];
-    let best = Infinity;
-    let candidates: typeof unsolved = [];
-    for (const p of unsolved) {
-      if (used.has(p.id)) continue;
-      const diff = Math.abs((p.rating as number) - target);
-      if (diff < best) {
-        best = diff;
-        candidates = [p];
-      } else if (diff === best) {
-        candidates.push(p);
-      }
-    }
-    if (candidates.length === 0) {
-      return NextResponse.json(
-        { error: `not enough unsolved Div. ${division} problems to fill slot ${i + 1}` },
-        { status: 409 },
-      );
-    }
-    const pick = candidates[Math.floor(Math.random() * candidates.length)];
-    used.add(pick.id);
-    slots.push({
-      label: String.fromCharCode(65 + i), // A, B, C, ...
-      id: pick.id,
-      contestId: pick.contestId,
-      index: pick.index,
-      name: pick.name,
-      rating: pick.rating as number,
-    });
+  const picked = pickSlots(typedPool, targets, solved);
+  if (!picked.ok) {
+    return NextResponse.json(
+      {
+        error: `not enough unsolved Div. ${division} problems to fill slot ${picked.slotIndex + 1}`,
+      },
+      { status: 409 },
+    );
   }
 
-  return NextResponse.json({ slots });
+  return NextResponse.json({ slots: picked.slots });
 }

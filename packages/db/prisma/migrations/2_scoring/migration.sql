@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "VirtualRound" ADD COLUMN "penalty" INTEGER;
+ALTER TABLE "VirtualRound" ADD COLUMN "ioiPoints" DOUBLE PRECISION;
+ALTER TABLE "VirtualRound" ADD COLUMN "score" DOUBLE PRECISION;

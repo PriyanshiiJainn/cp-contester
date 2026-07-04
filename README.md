@@ -18,44 +18,71 @@ the `/api/cf/[method]` proxy route.
 | `packages/rating` | Pure performance → delta estimator (Vitest-tested) |
 | `packages/db` | Prisma schema + client (`Problem`, `VirtualRound`) |
 
+## Architecture (what talks to what)
+
+```
+Browser ──► Next.js API routes ──► Codeforces API (proxy / build / ingest)
+                │
+                └──► Prisma ──► Supabase Postgres
+                     Problem cache + finished VirtualRound rows
+```
+
+You do **not** need `@supabase/supabase-js` or Supabase Auth for v1.
+Supabase is used only as a hosted Postgres database. Prisma is the client.
+In-flight contests live in `localStorage`; only finished rounds are written to
+the DB.
+
+## Connect Supabase (do this once)
+
+1. Create a free project at [supabase.com](https://supabase.com).
+2. Open **Project Settings → Database → Connection string**.
+3. Copy two URIs into both env files below (same values in each):
+
+   | Env var | Which string | Notes |
+   |---|---|---|
+   | `DATABASE_URL` | **Transaction** pooler (port **6543**) | Append `?pgbouncer=true` |
+   | `DIRECT_URL` | **Session** pooler (port **5432**) | Used by `prisma migrate` only |
+   | `CRON_SECRET` | any long random string | Guards `/api/ingest` |
+
+   ```bash
+   cp apps/web/.env.example apps/web/.env.local
+   cp packages/db/.env.example packages/db/.env
+   # edit both files with your real URIs + CRON_SECRET
+   ```
+
+4. Install, migrate, run:
+
+   ```bash
+   pnpm install                         # also runs prisma generate
+   pnpm --filter @cp/db migrate:deploy  # creates Problem + VirtualRound tables
+   pnpm --filter web dev                # http://localhost:3000
+   ```
+
+5. Seed the problem cache **once** (daily cron re-runs it in prod):
+
+   ```bash
+   curl -H "x-ingest-secret: <your-CRON_SECRET>" http://localhost:3000/api/ingest
+   ```
+
+   That pulls `problemset.problems` + `contest.list` (two CF calls), stamps
+   each problem's division from its contest title, and fills `Problem`
+   (~11k rows). Until this has run, "Start" returns
+   `503 problem cache is empty`.
+
 ## Local development
 
 ```bash
-pnpm install                    # also runs prisma generate
+pnpm install
 pnpm test                       # vitest: packages/rating + packages/cf
-cp apps/web/.env.example apps/web/.env.local   # fill in real values
-cp packages/db/.env.example packages/db/.env   # fill in real values (for prisma CLI)
-pnpm --filter @cp/db migrate:deploy            # apply migrations to Supabase
-pnpm --filter web dev                          # http://localhost:3000
+# (env files + migrate + ingest — see above)
+pnpm --filter web dev
 ```
-
-## Environment variables
-
-| Var | Where | What |
-|---|---|---|
-| `DATABASE_URL` | `apps/web` runtime (+ Vercel) | Supabase **pooled** connection (port 6543, `?pgbouncer=true`) |
-| `DIRECT_URL` | wherever `prisma migrate` runs | Supabase **direct** connection (port 5432) |
-| `CRON_SECRET` | `apps/web` runtime (+ Vercel) | Guards `/api/ingest`. On Vercel this exact name makes Vercel Cron send `Authorization: Bearer <value>` automatically |
-
-## The one manual step
-
-After migrating, seed the problem cache **once** (the daily cron re-runs it):
-
-```bash
-curl -H "x-ingest-secret: $CRON_SECRET" https://<your-app>/api/ingest
-# locally: curl -H "x-ingest-secret: dev-secret" http://localhost:3000/api/ingest
-```
-
-It pulls `problemset.problems` + `contest.list` (two CF calls total), stamps
-each problem's division from its contest title, and rebuilds the `Problem`
-table (~11k rows). Until it has run, "Start" will answer
-`503 problem cache is empty`.
 
 ## Deploying to Vercel
 
 1. Import the repo; set **Root Directory** to `apps/web` (Vercel detects the
    Turborepo + pnpm workspace and installs from the repo root).
-2. Set `DATABASE_URL`, `DIRECT_URL`, `CRON_SECRET` env vars.
+2. Set `DATABASE_URL`, `DIRECT_URL`, `CRON_SECRET` env vars (same as local).
 3. `apps/web/vercel.json` already schedules `/api/ingest` daily at 03:17 UTC.
 4. Run the migration once from your machine
    (`pnpm --filter @cp/db migrate:deploy`) and hit `/api/ingest` once.

@@ -160,11 +160,14 @@ export function ContestApp() {
   useEffect(() => {
     const stored = loadStoredRound();
     if (!stored) return;
+    // Set the ref immediately — setState alone won't update it until the next
+    // render, and finishContest (below) reads roundRef, not state.
+    roundRef.current = stored;
     setRound(stored);
     const storedEnd = stored.startedAt + stored.durationMin * 60_000;
     if (Date.now() >= storedEnd) {
       // Timer ran out while the tab was closed: settle the round now.
-      setPhase("running"); // roundRef must be set before finishing
+      setPhase("running");
       queueMicrotask(() => finishContest(storedEnd));
     } else {
       setPhase("running");

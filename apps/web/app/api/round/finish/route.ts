@@ -27,22 +27,26 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid request body" }, { status: 400 });
   }
 
-  const prisma = getPrisma();
-  const round = await prisma.virtualRound.create({
-    data: {
-      handle: body.handle,
-      division: body.division,
-      durationMin: body.durationMin,
-      startedAt: new Date(body.startedAt),
-      endedAt: new Date(body.endedAt),
-      problemIds: body.problemIds,
-      solvedIds: body.solvedIds,
-      perf: body.perf,
-      delta: body.delta,
-      ratingBefore: body.ratingBefore,
-    },
-    select: { id: true },
-  });
-
-  return NextResponse.json({ id: round.id });
+  try {
+    const prisma = getPrisma();
+    const round = await prisma.virtualRound.create({
+      data: {
+        handle: body.handle,
+        division: body.division,
+        durationMin: body.durationMin,
+        startedAt: new Date(body.startedAt),
+        endedAt: new Date(body.endedAt),
+        problemIds: body.problemIds,
+        solvedIds: body.solvedIds,
+        perf: body.perf,
+        delta: body.delta,
+        ratingBefore: body.ratingBefore,
+      },
+      select: { id: true },
+    });
+    return NextResponse.json({ id: round.id });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "database write failed";
+    return NextResponse.json({ error: message }, { status: 503 });
+  }
 }

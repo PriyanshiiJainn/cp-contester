@@ -13,11 +13,12 @@ import { getPrisma } from "@cp/db";
 
 export const dynamic = "force-dynamic";
 
+/** Five slots A–E; targets are typical CF difficulties for that division. */
 const SLOT_TARGETS: Record<string, number[]> = {
-  "4": [800, 900, 1000, 1100, 1300, 1500],
-  "3": [800, 900, 1100, 1300, 1500, 1700, 1900],
-  "2": [800, 1100, 1400, 1700, 2000, 2300],
-  "1": [1500, 1800, 2100, 2400, 2700, 3000],
+  "4": [800, 900, 1000, 1200, 1400],
+  "3": [800, 1000, 1200, 1500, 1800],
+  "2": [800, 1200, 1600, 2000, 2400],
+  "1": [1500, 1900, 2300, 2700, 3100],
 };
 
 const BodySchema = z.object({
